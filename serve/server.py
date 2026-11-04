@@ -3506,6 +3506,7 @@ def engine_args(cfg: dict, exe: str | None = None, *, announce: bool = True) -> 
     # else none, and says why in the engine's /metrics ("drafting_note"). The start never downloads.
     shaped = {**cfg, "args": args}
     backend, archs = drafting.detect_hardware()
+    archs = drafting.run_archs(archs, gpu_list(cfg))       # the card the config runs on first (a display card listed before it says nothing about DFlash2)
     parallel_n = cfg.get("parallel")
     decision = drafting.apply(shaped, klass=drafting_card_class(), data_dir=drafting.data_dir_of(args), backend=backend, archs=archs,
                               vram_mib=drafting_vram_mib(cfg, backend, archs),

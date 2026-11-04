@@ -25,6 +25,26 @@ def serving_dflash2():
     return mock.patch.object(drafting, "ENGINE_SERVES_DFLASH2", True)
 
 
+class TheConfiguredCardIsJudged(unittest.TestCase):
+    """A display card listed before the card that runs the model (an RX 6400, gfx1034, as HIP device 0 beside an RX 6950 XT, gfx1030, as device 1): the
+    drafter's line is about the configured card ("gpu"), and on a layer split about the Main card, the last one, where DFlash2 runs."""
+
+    def test_order(self):
+        r = drafting.run_archs
+        both = ["gfx1034", "gfx1030"]
+        for gpu in (1, "1", [1], "0,1", [0, 1]):
+            self.assertEqual(r(both, gpu)[0], "gfx1030", gpu)
+        self.assertEqual(r(both, [1, 0]), ["gfx1034", "gfx1030"], "a split whose Main card is device 0")
+        for gpu in (None, [], "", 5, [0, 7], "x"):
+            self.assertEqual(r(both, gpu), both, gpu)
+        self.assertEqual(r("gfx1201", 0), ["gfx1201"])
+
+    def test_the_line_follows_the_configured_card(self):
+        with mock.patch.object(drafting, "_TESTED", drafting._TESTED | {("hip", "gfx1030")}):
+            self.assertEqual(drafting.hardware_support("hip", drafting.run_archs(["gfx1034", "gfx1030"], 1)).level, "tested")
+            self.assertEqual(drafting.hardware_support("hip", ["gfx1034", "gfx1030"]).level, "untested")
+
+
 class IntelCardsAreToldByName(unittest.TestCase):
     """The SYCL path gives no architecture: an Intel card is told by its Windows adapter name or its Linux PCI id. Arc A-series (A3xx / A5xx / A7xx) was measured (the A750)
     and counts as tested; B-series (Battlemage), the Pro cards and integrated graphics keep "has not been tested on your graphics card yet"."""

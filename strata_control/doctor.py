@@ -47,6 +47,7 @@ def _drafter_is_dflash2(cfg: dict) -> bool:
     try:
         from strata_control import drafting
         backend, archs = drafting.detect_hardware()
+        archs = drafting.run_archs(archs, cfg.get("gpu"))
         return cfg.get("mtp") is not False and drafting.choice_of(cfg.get("drafting"), model_name=cfg.get("model_name"), backend=backend, archs=archs) == "dflash2"
     except Exception:                                    # noqa: BLE001 - unknown means the MTP, which stays required
         return False

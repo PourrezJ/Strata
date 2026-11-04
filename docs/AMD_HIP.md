@@ -34,7 +34,7 @@ runs are not supported. Use the [package table](#ready-made-packages) to match y
 | RX 9060 XT | gfx1200 | Validated by its owner |
 | RX 7800 XT / 7700 XT | gfx1101 | Validated by its owner |
 | RX 7600 XT | gfx1102 | Reported working, not validated |
-| RX 6800 / 6900 series, RX 6700 XT | gfx1030, gfx1031 | Has a package, not tested on a real card ([RDNA2](#rdna2-gfx1030)) |
+| RX 6800 / 6900 series, RX 6700 XT | gfx1030, gfx1031 | Has a package. An RX 6950 XT runs the engine and DFlash2 on Linux, owner build ([RDNA2](#rdna2-gfx1030)) |
 | Ryzen AI Max (Strix Halo) | gfx1151 | [STRIX_HALO.md](STRIX_HALO.md) |
 | Radeon 780M / 760M | gfx1103 | Linux, opt-in build: [RADEON_780M.md](RADEON_780M.md) |
 | Instinct MI50 / MI60, Radeon VII | gfx906 | Source build, community-tested ([gfx906](#gfx906-instinct-mi50--mi60-radeon-vii-wave64-built-from-source)) |
@@ -546,6 +546,79 @@ Other gfx103x and RDNA2-adjacent cards (community reports):
 | gfx1152, Radeon 860M / 840M (#1625) | Builds with a warning; portable kernels; no report; setup does not install for it |
 
 On Windows, setup's ready-made engine runs an RX 6800 beside a 780M iGPU (HIP numbers the RX 6800 as 1).
+
+### DFlash2 on gfx1030
+
+The DFlash2 drafter (`strata launch --drafting dflash2`, or `"drafting": "dflash2"` in the run config) runs on an RX 6950 XT. Its
+checks pass on the card: `dflash2_q4_parity` (40 of 40 cases equal to the CPU reference) and `dflash2_ring_test` (every scenario
+bit for bit). Build them with `tools/hip/build_rdna2_local.sh`, which also builds the engine against a ROCm SDK already on the PC.
+
+**The drafter's Q4_0 GEMM has a gfx1030 row.** The kernel shape is picked per card (`df2_q4_auto` in `src/kernels/cuda/dflash2.cu`);
+gfx1030 used to get the Blackwell shape. On gfx1030 the input width decides: the 2560-input matrices take eight warps a block,
+one row a warp, unroll 8, and the wider ones two warps, one row, unroll 1. All shapes give bitwise the same results.
+`STRATA_DF2_GEMM4=17` runs the old shape for an A/B.
+
+> **Measured on:** RX 6950 XT 16 GB (gfx1030), Ryzen 7 5800X, 32 GB RAM, Debian 13, ROCm 10.2.0a20261018 (TheRock, gfx103X), engine
+> 0.1.56, `dflash2_gemm_bench 200 q4` (8 columns, cold weights), two runs within 1%.
+
+| Matrix | Before | gfx1030 row |
+| --- | ---: | ---: |
+| gate+up 2560 -> 2x7680 | 86.5 us | 63.4 us |
+| qkv 2560 -> 6144 | 42.4 us | 31.2 us |
+| kv 2560 -> 2x1024 | 21.1 us | 12.4 us |
+| akp 2560 -> 640 | 12.2 us | 6.5 us |
+| selector 2560 -> 256 | 11.1 us | 5.3 us |
+| down 7680 -> 2560 | 47.9 us | 43.1 us |
+| o 4096 -> 2560 | 34.8 us | 29.5 us |
+| fc 12800 -> 2560 | 72.8 us | 70.5 us |
+| All eight | 329 us | 262 us |
+
+End to end, DFlash2 alone against no drafter (the prompt lookup of `--spec 4`, the run config's `"drafting": "off"`):
+
+> **Measured on:** the same PC, engine 0.1.56 (this build), Gyro-Coder TQ2_0 (agentionai), `--max-context 131072 --kv int8
+> --kv-resident 32768 --resident-experts --pool-workers 6`, `STRATA_SH_STREAM=1 STRATA_HIP_PROMPT_F16=1 STRATA_HC_PERSIST=1`, the
+> RX 6950 XT alone (HIP device 1; an RX 6400 drives the desktop). Six prompts (Python, C#, a JavaScript refactor, JSON extraction, a
+> French explanation, bash), 250-320 greedy tokens each, two rounds per arm (the second in reverse order), decode speed from the
+> server's timings. DFlash2 started with `--spec 6 --draft-conf 0.7` (the confidence setup picks for 6,802 expert slots) and the
+> Q4_0-selector pack.
+
+| Arm | Decode, 6 prompts | Against no drafter (geometric mean) | Drafts accepted |
+| --- | ---: | ---: | ---: |
+| No drafter | 32.9-38.5 tok/s | - | 61% (prompt lookup) |
+| DFlash2 | 42.5-54.3 tok/s | +28.9% (rounds: +30.6%, +27.2%) | 83% |
+| DFlash2, old GEMM shape (`STRATA_DF2_GEMM4=17`) | 42.3-53.9 tok/s | +26.7% (+24.9%, +28.0%) | 83% |
+| DFlash2, French draft vocabulary (`data/draft_vocab_fr.bin`) | 39.8-52.0 tok/s | +29.5% (+26.9%, +32.1%) | 83% |
+
+DFlash2 takes 0.86 GiB of the expert cache's room (6,802 slots against 7,506), and still gains. The GEMM row's end-to-end effect
+(+1.7%) is within the spread of two rounds; the bench above is where it shows. The French vocabulary is level with the default
+on these prompts.
+
+Greedy text is not a strict check on this setup. The no-drafter arm differs from itself between two starts after 78 to 822
+characters of about 1,400, because the experts' GPU/CPU split changes the rounding. DFlash2's answers part from the no-drafter
+answers within the same range.
+
+No other window or confidence beat the one setup picks by more than the rounds' spread (one round each against the mean of two
+default rounds; the default rounds were +33.3% and +29.6% against no drafter):
+
+| Setting | Against the default |
+| --- | ---: |
+| `--draft-conf 0.5` | +1.9% (within the rounds' spread) |
+| `--draft-conf 0.85` | -8.7% |
+| `--spec 4` | -5.1% |
+| `--spec 8` | -2.6% |
+
+A long prompt, the same PC and setup: one 44,538-token request with a functional check of the code it writes, one start per arm.
+
+| Arm | Prompt read | Decode | Check |
+| --- | ---: | ---: | --- |
+| No drafter | 1,313 tok/s | 29.3 tok/s | failed (the answer's own assert) |
+| DFlash2 | 1,297 tok/s | 41.5 tok/s | passed |
+
+DFlash2 was not compared with the MTP drafter on this card (the MTP layer is not on this PC), so the drafter table in
+`strata_control/drafting.py` still says it was not tested here.
+
+**A display card listed first.** With a small Radeon for the desktop as HIP device 0 and the RX 6950 XT as device 1 (`"gpu": 1`),
+the drafter's line now describes the configured card, not the first one the driver lists (`strata_control/drafting.py run_archs`).
 
 ## gfx906 (Instinct MI50 / MI60, Radeon VII): wave64, built from source
 

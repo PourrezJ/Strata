@@ -57,6 +57,22 @@ ARCH_CLASS = (
 )
 
 
+def run_archs(archs: Any, gpus: Any) -> list[str]:
+    """The cards' architectures with the card DFlash2 runs on first. ``archs`` lists every card in the driver's order (detect_hardware), ``gpus`` the run
+    config's card numbers ("gpu", serve/server.py gpu_list: the Main card last on a layer split, which is where the drafter runs). A PC whose display card
+    comes first (an RX 6400 beside an RX 6950 XT: ['gfx1034', 'gfx1030'] with "gpu": 1) is then told about the card that runs the model, not the other one.
+    The list as it is when ``gpus`` names none or a number past its end."""
+    items = [archs] if isinstance(archs, str) else list(archs or [])
+    try:
+        nums = [int(g) for g in (str(gpus).split(",") if isinstance(gpus, (int, str)) else list(gpus or [])) if str(g).strip() != ""]
+    except (TypeError, ValueError):
+        return items
+    if not nums or any(n < 0 or n >= len(items) for n in nums):
+        return items
+    order = list(reversed(nums))
+    return [items[n] for n in order] + [a for i, a in enumerate(items) if i not in order]
+
+
 def card_class(archs: Any) -> str:
     """The class of the first card whose architecture the table knows (``sm_120``, ``gfx1151``...); ``other`` for an unknown or empty list."""
     for arch in ([archs] if isinstance(archs, str) else list(archs or [])):

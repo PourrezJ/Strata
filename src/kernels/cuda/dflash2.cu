@@ -999,20 +999,26 @@ void df2_attention_variant(int v) { g_attn_variant = v; }
 // 110 SMs) for every matrix, within 0-2 us of the best on a 188-SM RTX PRO 6000.  gfx12 (R9700, gfx1201, p620, 8 columns, cold weights, two bench runs): the same shape with unroll 1
 // (26) is 25-45% faster on every matrix of 1000 rows and more (gate+up 56 -> 44.5 us, down 39 -> 23.4, qkv 26.8 -> 21.4, o 23.6 -> 14.9, fc 61.5 -> 35.2, kv 15.2 -> 10.0), and one
 // warp a row with unroll 1 (31) is 2x faster on the 256 and 640 row matrices (akp / mkp 12.1 -> 6.3 us, selector 11.1 -> 5.2); all bitwise the same results.
-static int df2_q4_auto(int rows) {
+// gfx1030 (RX 6950 XT, ROCm 10.2.0a20261018, 8 columns, cold weights, two bench runs within 1%): the input width decides, not the rows.  The 2560-input matrices
+// take eight warps a block, one row a warp, unroll 8 (21): gate+up 86.5 -> 63.4 us, qkv 42.4 -> 31.2, kv 21.1 -> 12.4, akp 12.2 -> 6.5, selector 11.1 -> 5.3.  The wider
+// ones take two warps, one row, unroll 1 (38): down 47.9 -> 43.1, o 34.8 -> 29.5, fc 72.8 -> 70.5 (21 is slower there: down 56.3, fc 105.5).  All eight: 329 -> 262 us.
+static int df2_q4_auto(int rows, int n_in) {
 #if defined(STRATA_USE_HIP)
-    static const bool gfx12 = [] {
+    static const int family = [] {
         int dev = 0;
         cudaDeviceProp p;
-        return cudaGetDevice(&dev) == cudaSuccess && cudaGetDeviceProperties(&p, dev) == cudaSuccess && strata::kernels::gfx_arch_is_gfx12(p.gcnArchName);
+        if (cudaGetDevice(&dev) != cudaSuccess || cudaGetDeviceProperties(&p, dev) != cudaSuccess) return 0;
+        return strata::kernels::gfx_arch_is_gfx12(p.gcnArchName) ? 12 : strata::kernels::gfx_arch_is(p.gcnArchName, "gfx1030") ? 1030 : 0;
     }();
-    if (gfx12) return rows <= 640 ? 31 : 26;
+    if (family == 12) return rows <= 640 ? 31 : 26;
+    if (family == 1030) return n_in <= 2560 ? 21 : 38;
 #endif
     (void) rows;
+    (void) n_in;
     return 17;
 }
 #ifndef DF2_Q4_AUTO
-#define DF2_Q4_AUTO(rows) df2_q4_auto(rows)
+#define DF2_Q4_AUTO(rows, n_in) df2_q4_auto(rows, n_in)
 #endif
 void df2_gemm(const Df2Mat* mats, int n, const void* xq, const float* xd, int n_in, int ncols, void* stream) {
     if (n < 1 || n > 3 || n_in % 512 != 0 || ncols < 1 || ncols > 8) throw std::invalid_argument("df2_gemm: unsupported shape");
@@ -1030,7 +1036,7 @@ void df2_gemm(const Df2Mat* mats, int n, const void* xq, const float* xd, int n_
     cudaStream_t st = (cudaStream_t) stream;
     if (mats[0].q4) {   // the Q4_0 pack: 4 warps a block when the rows allow, else 2; the rows-a-warp variants (bitwise the same results) by matrix size
         static const int tune4 = [] { const char* e = std::getenv("STRATA_DF2_GEMM4"); return e ? std::atoi(e) : 0; }();   // 0: the table; 1: 8 rows a warp as before; 10 and up: that variant for every matrix (bench / A/B)
-        int v4 = g_gemm_variant != 0 ? g_gemm_variant : tune4 >= 10 ? tune4 : tune4 != 0 ? 1 : DF2_Q4_AUTO(rows);
+        int v4 = g_gemm_variant != 0 ? g_gemm_variant : tune4 >= 10 ? tune4 : tune4 != 0 ? 1 : DF2_Q4_AUTO(rows, n_in);
 #define DF2_ROWS4_CASE(V, W, R, U) case V: gemm4_rows_kernel<W, R, U><<<(rows / 8) * (8 / R) / W, W * 32, 0, st>>>(segs, xqp, xd, n_in, ncols); break;
         switch (v4) {
             DF2_ROWS4_CASE(10, 4, 4, 2)

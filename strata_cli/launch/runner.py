@@ -1553,6 +1553,7 @@ class Runner:
         """What strata_control/drafting.py needs to decide for this launch: the choice, the card class, the model and the data folder."""
         from strata_control import drafting
         backend, archs = drafting.detect_hardware()
+        archs = drafting.run_archs(archs, self.s.gpus if self.s.gpus else cfg.get("gpu"))
         mode = self.s.drafting if self.s.drafting is not None else cfg.get("drafting")
         args = cfg.get("args") or []
         if cfg.get("mtp") is False and drafting.normalize(mode) == "auto":
