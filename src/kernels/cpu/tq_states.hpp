@@ -72,13 +72,24 @@ inline uint32_t tq_state_tqp(const uint8_t* qs, int t) {
     const uint32_t w = (uint32_t) qs[i0] | ((uint32_t) qs[i1] << 8) | ((uint32_t) qs[i2] << 16);
     return (w >> (off & 7)) & kTqStateMask;
 }
+/// All 64 states, the same bits as tq_state_tqp: one 32-bit read each, as tq_states does, and the windows that run
+/// past the end of the 8*KB bytes read a 64-bit view of the last four bytes followed by the first four.
 template <int KB>
 inline void tq_states_tqp(const uint8_t* qs, uint32_t* st) {
+    constexpr int NB = 8 * KB;
+    const uint64_t wrap = (uint64_t) tq_ld32(qs + NB - 4) | ((uint64_t) tq_ld32(qs) << 32);
 #if defined(__GNUC__)
 #pragma GCC unroll 64
 #endif
-    for (int t = 0; t < 64; ++t) st[t] = tq_state_tqp<KB>(qs, t);
+    for (int t = 0; t < 64; ++t) {
+        const int off = (63 - t) * KB, b = off >> 3;
+        const uint32_t v = b + 4 <= NB ? tq_ld32(qs + b) >> (off & 7) : (uint32_t) (wrap >> (off - 8 * (NB - 4)));
+        st[t] = v & kTqStateMask;
+    }
 }
+
+/// The codebook point of a state (the first of the two the state table's row holds, see fill_table in tq_cpu.cpp).
+inline uint32_t tq_point(uint32_t s) { return (s * 0x9e3779b1u) >> 21; }
 
 /// fp16 bits -> float, exact (the block scales and the Q8_0 activation scales).
 inline float tq_half_to_float(uint16_t h) {

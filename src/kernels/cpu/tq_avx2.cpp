@@ -16,6 +16,8 @@
 
 #include <immintrin.h>
 
+#include <algorithm>
+
 namespace strata::kernels::cpu::tq_detail {
 namespace {
 
@@ -76,20 +78,82 @@ void rows_t(const int16_t* table, const uint8_t* w, size_t row_bytes, int n, con
 }
 
 // TQP (147-149): 64 pair-steps per 128-value block.  A step's two weights are the FIRST pair of its state
-// table row, so 8 states make one YMM of 16 int16 weights, and a 32-value group (16 steps) is two YMM of
-// weights against two YMM of activations: VPMADDWD, one exact int32 sum per group, then the four group sums
-// go into the same per-token __m128 the other kernels use, so the float part is the scalar kernel's.
-inline __m256i pairs8(const int16_t* tab, uint32_t s0, uint32_t s1, uint32_t s2, uint32_t s3, uint32_t s4,
-                      uint32_t s5, uint32_t s6, uint32_t s7) {
-    const __m128i a0 = _mm_unpacklo_epi32(_mm_loadl_epi64((const __m128i*) (tab + 4 * s0)),
-                                          _mm_loadl_epi64((const __m128i*) (tab + 4 * s1)));
-    const __m128i a1 = _mm_unpacklo_epi32(_mm_loadl_epi64((const __m128i*) (tab + 4 * s2)),
-                                          _mm_loadl_epi64((const __m128i*) (tab + 4 * s3)));
-    const __m128i a2 = _mm_unpacklo_epi32(_mm_loadl_epi64((const __m128i*) (tab + 4 * s4)),
-                                          _mm_loadl_epi64((const __m128i*) (tab + 4 * s5)));
-    const __m128i a3 = _mm_unpacklo_epi32(_mm_loadl_epi64((const __m128i*) (tab + 4 * s6)),
-                                          _mm_loadl_epi64((const __m128i*) (tab + 4 * s7)));
-    return _mm256_set_m128i(_mm_unpacklo_epi64(a2, a3), _mm_unpacklo_epi64(a0, a1));
+// table row, i.e. codebook point tq_point(s): the 2048 points as int16 pairs (tq_pair_table, 8 KiB) stay in L1,
+// where the 256 KiB state table's rows did not.
+//
+// The points come 8 states at a time in SIMD (TqpPlan): two 16-byte windows of the block's 8*KB stream bytes (one
+// per 128-bit lane, never past the block), VPSHUFB to each state's 4 bytes, VPSRLVD by its bit offset, the mask, then
+// the hash (VPMULLD, VPSRLD).  The 2-3 states whose 15 bits run past the end of the stream are redone in scalar code.
+// Unlike the 4-weight types above (no hash), the SIMD states pay here because the hash goes with them.  Each YMM of
+// 16 int16 weights is then built from 8 table loads (VMOVD / VPINSRD), so a 32-value group (16 steps) is two YMM of
+// weights against two YMM of activations: VPMADDWD, then per token rows_t's VPHADDD tree leaves the four exact group
+// sums in one XMM, so the float part is the scalar kernel's.
+//
+// Measured on Zen 3 (5800X, TQP5-7 rows of 2048, 96 MiB per thread), ns per block at one / four tokens:
+//   1 thread    21 / 28-29   this kernel
+//               26-28 / 33-34  scalar states and hash, the pairs through a stack buffer
+//               39-41 / 56-62  scalar states, 8-byte state-table loads per pair, a horizontal sum per group
+//   8 threads   22 / 31  against 28 / 35 and 41 / 62 (15 threads on the 8 cores: no more than 8)
+// VPGATHERDD for the pairs (from this table or a state-indexed one) was slower than the scalar loads there.
+struct TqpPlan {
+    alignas(32) uint8_t shuf[8][32];   // per 8 states: each state's 4 bytes from its lane's window
+    alignas(32) uint32_t shift[8][8];  // and its bit offset in them
+    int base[8][2];                    // the window of each 128-bit lane, bytes from the stream's start
+    int nwrap;
+    int wrap_t[8];                     // the states that run past the end of the stream
+};
+
+// constexpr, so each kernel sees its plan as constants (the windows, the shifts and which states wrap): built at run
+// time behind a guard instead, the same kernel measured 27 ns per block, not 21
+constexpr TqpPlan make_tqp_plan(int kb) {
+    TqpPlan p{};
+    const int nb = 8 * kb;
+    for (int k = 0; k < 8; ++k)
+        for (int l = 0; l < 2; ++l) {
+            const int base = std::min(((63 - (8 * k + 4 * l + 3)) * kb) >> 3, nb - 16);   // the lane's lowest state
+            p.base[k][l] = base;
+            for (int j = 0; j < 4; ++j) {
+                const int t = 8 * k + 4 * l + j, off = (63 - t) * kb, b = off >> 3;
+                const bool wraps = ((off + 14) >> 3) >= nb;
+                if (wraps) p.wrap_t[p.nwrap++] = t;
+                for (int q = 0; q < 4; ++q) {
+                    const int ix = b - base + q;
+                    p.shuf[k][16 * l + 4 * j + q] = (uint8_t) (wraps || ix < 0 || ix > 15 ? 0x80 : ix);
+                }
+                p.shift[k][4 * l + j] = (uint32_t) (off & 7);
+            }
+        }
+    return p;
+}
+
+template <int KB>
+inline constexpr TqpPlan kTqpPlan = make_tqp_plan(KB);
+
+// the codebook points of a block's 64 states (tq_point(tq_state_tqp(qs, t)))
+template <int KB>
+inline void tqp_points(const uint8_t* qs, const TqpPlan& p, uint32_t* pt) {
+    const __m256i mask = _mm256_set1_epi32((int) kTqStateMask), mul = _mm256_set1_epi32((int) 0x9e3779b1u);
+#pragma GCC unroll 8
+    for (int k = 0; k < 8; ++k) {
+        const __m256i v0 = _mm256_set_m128i(_mm_loadu_si128((const __m128i*) (qs + p.base[k][1])),
+                                            _mm_loadu_si128((const __m128i*) (qs + p.base[k][0])));
+        __m256i v = _mm256_shuffle_epi8(v0, _mm256_load_si256((const __m256i*) p.shuf[k]));
+        v = _mm256_and_si256(_mm256_srlv_epi32(v, _mm256_load_si256((const __m256i*) p.shift[k])), mask);
+        _mm256_store_si256((__m256i*) (pt + 8 * k), _mm256_srli_epi32(_mm256_mullo_epi32(v, mul), 21));
+    }
+    for (int i = 0; i < p.nwrap; ++i) pt[p.wrap_t[i]] = tq_point(tq_state_tqp<KB>(qs, p.wrap_t[i]));
+}
+
+// 8 steps' pairs into one YMM
+inline __m256i pairs8(const int* tab, const uint32_t* pt) {
+    __m128i lo = _mm_cvtsi32_si128(tab[pt[0]]), hi = _mm_cvtsi32_si128(tab[pt[4]]);
+    lo = _mm_insert_epi32(lo, tab[pt[1]], 1);
+    hi = _mm_insert_epi32(hi, tab[pt[5]], 1);
+    lo = _mm_insert_epi32(lo, tab[pt[2]], 2);
+    hi = _mm_insert_epi32(hi, tab[pt[6]], 2);
+    lo = _mm_insert_epi32(lo, tab[pt[3]], 3);
+    hi = _mm_insert_epi32(hi, tab[pt[7]], 3);
+    return _mm256_set_m128i(hi, lo);
 }
 
 template <int KB>
@@ -97,38 +161,34 @@ void rows_tqp_t(const uint8_t* w, size_t row_bytes, int n, const TqAct* const* a
                 int r1) {
     const int nb = n / 128;
     constexpr size_t bsz = 2 + 8 * KB;
-    const int16_t* tab = tq_state_table();
+    const int* pairs = (const int*) tq_pair_table();
+    constexpr const TqpPlan& plan = kTqpPlan<KB>;
     for (int r = r0; r < r1; ++r) {
         const uint8_t* x = w + (size_t) r * row_bytes;
         __m128 acc[kTqMaxTokens];
         for (int t = 0; t < nt; ++t) acc[t] = _mm_setzero_ps();
         for (int i = 0; i < nb; ++i) {
             const uint8_t* blk = x + (size_t) i * bsz;
-            uint32_t st[64];
-            tq_states_tqp<KB>(blk + 2, st);
+            alignas(32) uint32_t pt[64];
+            tqp_points<KB>(blk + 2, plan, pt);
             __m256i wv[8];   // wv[2g], wv[2g+1]: the weights of the 32-value group g
-#pragma GCC unroll 4
-            for (int g = 0; g < 4; ++g) {
-                const uint32_t* s = st + 16 * g;
-                wv[2 * g] = pairs8(tab, s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7]);
-                wv[2 * g + 1] = pairs8(tab, s[8], s[9], s[10], s[11], s[12], s[13], s[14], s[15]);
-            }
+#pragma GCC unroll 8
+            for (int k = 0; k < 8; ++k) wv[k] = pairs8(pairs, pt + 8 * k);
             const __m128 dx = _mm_set1_ps(tq_half_to_float(tq_ld16(blk)));
             for (int t = 0; t < nt; ++t) {
                 const __m256i* q = (const __m256i*) (a[t]->q + 128 * i);
-                int32_t sum[4];
-#pragma GCC unroll 4
-                for (int g = 0; g < 4; ++g) {
-                    const __m256i p = _mm256_add_epi32(_mm256_madd_epi16(wv[2 * g], _mm256_load_si256(q + 2 * g)),
-                                                       _mm256_madd_epi16(wv[2 * g + 1], _mm256_load_si256(q + 2 * g + 1)));
-                    __m128i s = _mm_add_epi32(_mm256_castsi256_si128(p), _mm256_extracti128_si256(p, 1));
-                    s = _mm_hadd_epi32(s, s);
-                    s = _mm_hadd_epi32(s, s);
-                    sum[g] = _mm_cvtsi128_si32(s);
-                }
+                const __m256i p0 = _mm256_add_epi32(_mm256_madd_epi16(wv[0], _mm256_load_si256(q + 0)),
+                                                    _mm256_madd_epi16(wv[1], _mm256_load_si256(q + 1)));
+                const __m256i p1 = _mm256_add_epi32(_mm256_madd_epi16(wv[2], _mm256_load_si256(q + 2)),
+                                                    _mm256_madd_epi16(wv[3], _mm256_load_si256(q + 3)));
+                const __m256i p2 = _mm256_add_epi32(_mm256_madd_epi16(wv[4], _mm256_load_si256(q + 4)),
+                                                    _mm256_madd_epi16(wv[5], _mm256_load_si256(q + 5)));
+                const __m256i p3 = _mm256_add_epi32(_mm256_madd_epi16(wv[6], _mm256_load_si256(q + 6)),
+                                                    _mm256_madd_epi16(wv[7], _mm256_load_si256(q + 7)));
+                const __m256i h = _mm256_hadd_epi32(_mm256_hadd_epi32(p0, p1), _mm256_hadd_epi32(p2, p3));
+                const __m128i s = _mm_add_epi32(_mm256_castsi256_si128(h), _mm256_extracti128_si256(h, 1));
                 const __m128 sc = _mm_mul_ps(dx, _mm_loadu_ps(a[t]->d + 4 * i));
-                const __m128i s4 = _mm_set_epi32(sum[3], sum[2], sum[1], sum[0]);
-                acc[t] = _mm_fmadd_ps(_mm_cvtepi32_ps(s4), sc, acc[t]);
+                acc[t] = _mm_fmadd_ps(_mm_cvtepi32_ps(s), sc, acc[t]);
             }
         }
         for (int t = 0; t < nt; ++t) {

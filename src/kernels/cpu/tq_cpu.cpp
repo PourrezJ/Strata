@@ -27,6 +27,7 @@ namespace {
 
 alignas(64) int16_t g_table[(tq_detail::kTqStateMask + 1) * 4];
 alignas(64) int16_t g_table_c[(tq_detail::kTqStateMask + 1) * 4];
+alignas(64) int32_t g_pairs[2048];
 
 void fill_table() {
     for (uint32_t s = 0; s <= tq_detail::kTqStateMask; ++s) {
@@ -43,6 +44,17 @@ void fill_table() {
 
 void fill_table_computed() {
     for (uint32_t s = 0; s <= tq_detail::kTqStateMask; ++s) tq_detail::comp_state4(s, g_table_c + 4 * s);
+}
+
+void fill_pairs() {
+    for (int p = 0; p < 2048; ++p) {
+        int16_t v[2];
+        for (int j = 0; j < 2; ++j) {   // fill_table's rounding
+            const float f = tq_detail::tq_half_to_float(tq_lut_f16[2 * p + j]) * 8192.0f;
+            v[j] = (int16_t) (f < 0.0f ? f - 0.5f : f + 0.5f);
+        }
+        std::memcpy(&g_pairs[p], v, 4);
+    }
 }
 
 int env_isa_cap() {
@@ -133,6 +145,12 @@ const int16_t* tq_state_table_computed() {
     static std::once_flag once;
     std::call_once(once, fill_table_computed);
     return g_table_c;
+}
+
+const int32_t* tq_pair_table() {
+    static std::once_flag once;
+    std::call_once(once, fill_pairs);
+    return g_pairs;
 }
 
 const int16_t* tq_state_table_for(int t) { return (t == kTqTypeK5X || t == kTqTypeK4X) ? tq_state_table_computed() : tq_state_table(); }

@@ -67,6 +67,9 @@ const int16_t* tq_state_table();
 const int16_t* tq_state_table_computed();
 /// The table a type decodes with.
 const int16_t* tq_state_table_for(int ggml_type);
+/// The 2048 codebook points as int16 pairs at scale 2^13 (8 KiB, the state table's values): the pair layout's
+/// weights 2t, 2t+1 are tq_pair_table()[point(state t)], as two int16 in one int32.
+const int32_t* tq_pair_table();
 
 /// Rows [r0, r1) of a trellis matrix (`row_bytes` per row, `n` weights per row) against `nt` (<= 8) Q8_0
 /// activations of n values: out[t][r] = w_r . a[t].
